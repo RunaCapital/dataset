@@ -825,7 +825,7 @@ class Table(object):
 
             batch_sql_template = ", ".join([f"({all_values_sql_template.format(i=i)})" for i in range(len(chunk))])
             params = {f"{key.replace(' ', '_')}{i}": row[key] for i, row in enumerate(chunk) for key in row}
-            query_str = f"""INSERT INTO "{self.name}" ({all_columns_sql_template}) VALUES {batch_sql_template} {on_conflict_statement}"""
+            query_str = f"""INSERT INTO {self.schema}."{self.name}" ({all_columns_sql_template}) VALUES {batch_sql_template} {on_conflict_statement}"""
 
             self.db.query(query_str, **params)
             self.db.commit()
