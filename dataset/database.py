@@ -1,3 +1,5 @@
+from typing import Type
+
 import logging
 import threading
 from urllib.parse import parse_qs, urlparse
@@ -12,8 +14,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
 from dataset.table import Table
-from dataset.util import ResultIter, row_type, safe_url, QUERY_STEP
-from dataset.util import normalize_table_name
+from dataset.util import ResultIter, row_type, safe_url, QUERY_STEP, extract_schema_and_table
 from dataset.types import Types
 
 log = logging.getLogger(__name__)
@@ -24,13 +25,13 @@ class Database(object):
 
     def __init__(
         self,
-        url,
-        schema=None,
-        engine_kwargs=None,
-        ensure_schema=True,
-        row_type=row_type,
-        sqlite_wal_mode=True,
-        on_connect_statements=None,
+        url: str,
+        schema: str = None,
+        engine_kwargs: dict = None,
+        ensure_schema: bool = True,
+        row_type: Type = row_type,
+        sqlite_wal_mode: bool = True,
+        on_connect_statements: list[str] = None,
     ):
         """Configure and connect to the database."""
         if engine_kwargs is None:
@@ -100,8 +101,9 @@ class Database(object):
         """Get a SQLAlchemy inspector."""
         return inspect(self.executable)
 
-    def has_table(self, name):
-        return self.inspect.has_table(name, schema=self.schema)
+    def has_table(self, table_name: str):
+        schema, name = extract_schema_and_table(table_name, default_schema=self.schema)
+        return self.inspect.has_table(name, schema=schema)
 
     @property
     def metadata(self):
@@ -178,23 +180,35 @@ class Database(object):
         self._tables = {}
         self.engine = None
 
-    @property
-    def tables(self):
-        """Get a listing of all tables that exist in the database."""
-        return self.inspect.get_table_names(schema=self.schema)
+    def get_tables(self, schema: str) -> list[str]:
+        """Get a listing of all tables that exist in the schema."""
+        return self.inspect.get_table_names(schema=schema)
+
+    def get_views(self, schema: str) -> list[str]:
+        """Get a listing of all views that exist in the schema."""
+        return self.inspect.get_view_names(schema=schema)
 
     @property
-    def views(self):
-        """Get a listing of all views that exist in the database."""
-        return self.inspect.get_view_names(schema=self.schema)
+    def schemas(self) -> list[str]:
+        return self.inspect.get_schema_names()
 
-    def __contains__(self, table_name):
+    @property
+    def tables(self) -> list[str]:
+        """Get a listing of all tables that exist in the current schema."""
+        return self.get_tables(schema=self.schema)
+
+    @property
+    def views(self) -> list[str]:
+        """Get a listing of all views that exist in the current schema."""
+        return self.get_views(schema=self.schema)
+
+    def __contains__(self, table_name: str) -> bool:
         """Check if the given table name exists in the database."""
         try:
-            table_name = normalize_table_name(table_name)
-            if table_name in self.tables:
+            table_schema, table_name = extract_schema_and_table(table_name, default_schema=self.schema)
+            if table_name in self.get_tables(table_schema):
                 return True
-            if table_name in self.views:
+            if table_name in self.get_views(table_schema):
                 return True
             return False
         except ValueError:
@@ -234,7 +248,6 @@ class Database(object):
         assert not isinstance(
             primary_type, str
         ), "Text-based primary_type support is dropped, use db.types."
-        table_name = normalize_table_name(table_name)
         with self.lock:
             if table_name not in self._tables:
                 self._tables[table_name] = Table(
@@ -247,7 +260,7 @@ class Database(object):
                 )
             return self._tables.get(table_name)
 
-    def load_table(self, table_name):
+    def load_table(self, table_name: str) -> Table:
         """Load a table.
 
         This will fail if the tables does not already exist in the database. If
@@ -259,7 +272,6 @@ class Database(object):
 
             table = db.load_table('population')
         """
-        table_name = normalize_table_name(table_name)
         with self.lock:
             if table_name not in self._tables:
                 self._tables[table_name] = Table(self, table_name)
@@ -267,11 +279,11 @@ class Database(object):
 
     def get_table(
         self,
-        table_name,
+        table_name: str,
         primary_id=None,
         primary_type=None,
         primary_increment=None,
-    ):
+    ) -> Table:
         """Load or create a table.
 
         This is now the same as ``create_table``.
@@ -287,7 +299,7 @@ class Database(object):
             table_name, primary_id, primary_type, primary_increment
         )
 
-    def __getitem__(self, table_name):
+    def __getitem__(self, table_name: str) -> Table:
         """Get a given table."""
         return self.get_table(table_name)
 

@@ -3,6 +3,7 @@ from urllib.parse import urlparse, urlencode
 from collections import OrderedDict
 from sqlalchemy.exc import ResourceClosedError
 
+
 QUERY_STEP = 1000
 row_type = OrderedDict
 
@@ -14,8 +15,6 @@ try:
         if row is None:
             return None
         return row_type(row._mapping.items())
-
-
 except ImportError:
     # SQLAlchemy < 1.4.0, no _mapping.
 
@@ -134,7 +133,7 @@ def normalize_column_key(name):
     return name.upper().strip().replace(" ", "")
 
 
-def normalize_table_name(name):
+def normalize_table_name(name: str) -> str:
     """Check if the table name is obviously invalid."""
     if not isinstance(name, str):
         raise ValueError("Invalid table name: %r" % name)
@@ -167,3 +166,19 @@ def pad_chunk_columns(chunk, columns):
         for column in columns:
             record.setdefault(column, None)
     return chunk
+
+
+def extract_schema_and_table(table_fullname: str, default_schema: str = 'public') -> tuple[str, str]:
+    """
+    Extracts table schema and name from fullname e.g. `private.employees`.
+    If schema is not specified - use `default_schema` as default.
+
+    :param table_fullname: pg table fullname with schema or without. E.g. `employees` or `private.employees`.
+    :param default_schema: default_schema if not specified in table_fullname
+    :return: tuple[table_schema: str, table_name: str]
+    """
+    if '.' in table_fullname:
+        schema, table = table_fullname.split('.')
+    else:
+        schema, table = default_schema, table_fullname
+    return schema, table

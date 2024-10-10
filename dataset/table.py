@@ -1,3 +1,6 @@
+import json
+from typing import TYPE_CHECKING, Type, Literal
+
 import logging
 import warnings
 import threading
@@ -10,11 +13,15 @@ from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
 from sqlalchemy.exc import NoSuchTableError
 
-from dataset.types import Types, MYSQL_LENGTH_TYPES
-from dataset.util import index_name
-from dataset.util import DatasetException, ResultIter, QUERY_STEP
-from dataset.util import normalize_table_name, pad_chunk_columns
-from dataset.util import normalize_column_name, normalize_column_key
+from .types import Types, MYSQL_LENGTH_TYPES
+from .util import index_name
+from .util import DatasetException, ResultIter, QUERY_STEP
+from .util import normalize_table_name, pad_chunk_columns
+from .util import normalize_column_name, normalize_column_key
+from .util import extract_schema_and_table
+
+if TYPE_CHECKING:
+    from .database import Database
 
 
 log = logging.getLogger(__name__)
@@ -25,19 +32,23 @@ class Table(object):
 
     PRIMARY_DEFAULT = "id"
 
+    _table: SQLATable = None
+
     def __init__(
         self,
-        database,
-        table_name,
-        primary_id=None,
-        primary_type=None,
-        primary_increment=None,
-        auto_create=False,
+        database: 'Database',
+        table_name: str,
+        primary_id: str = None,
+        primary_type: Type = None,
+        primary_increment: bool = None,
+        auto_create: bool = False,
     ):
         """Initialise the table from database schema."""
         self.db = database
+        table_schema, table_name = extract_schema_and_table(table_name, default_schema=database.schema)
+        self.schema = table_schema
         self.name = normalize_table_name(table_name)
-        self._table = None
+        self.fullname = self.schema + '.' + self.name
         self._columns = None
         self._indexes = []
         self._primary_id = (
@@ -50,21 +61,21 @@ class Table(object):
         self._auto_create = auto_create
 
     @property
-    def exists(self):
+    def exists(self) -> bool:
         """Check to see if the table currently exists in the database."""
         if self._table is not None:
             return True
-        return self.name in self.db
+        return self.fullname in self.db
 
     @property
-    def table(self):
+    def table(self) -> SQLATable:
         """Get a reference to the table, which may be reflected or created."""
         if self._table is None:
             self._sync_table(())
         return self._table
 
     @property
-    def _column_keys(self):
+    def _column_keys(self) -> dict:
         """Get a dictionary of all columns and their case mapping."""
         if not self.exists:
             return {}
@@ -82,11 +93,53 @@ class Table(object):
             return self._columns
 
     @property
-    def columns(self):
+    def columns(self) -> list[str]:
         """Get a listing of all columns that exist in the table."""
         return list(self._column_keys.values())
 
-    def has_column(self, column):
+    @property
+    def structure(self) -> dict[str, str]:
+        """
+        Retrieve the table structure as a dictionary mapping column names to data types.
+
+        :return: Dictionary in the form {column_name: data_type}
+        """
+
+        structure = {}
+        for column in self.table.columns:
+            column_name = column.name
+            data_type = column.type.__class__.__name__
+            # Handle ARRAY types specifically if needed
+            if hasattr(column.type, 'item_type'):
+                # This is a simple check for ARRAY types; adjust as necessary
+                data_type = f"{column.type.item_type}[]"
+            structure[column_name] = data_type
+        return structure
+
+    @property
+    def indexes(self) -> dict[str, str]:
+        """
+        Retrieve the table's indexes as a dictionary mapping index names to their details.
+
+        :return: Dictionary in the form {index_name: index_details}
+        :raises: TableDoesNotExist
+        """
+        res = list(self.db.query(f"""
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname='{self.schema}' AND tablename='{self.name}';
+        """))
+        return {row['indexname']: row['indexdef'] for row in res}
+
+    @property
+    def primary_key(self) -> list[str]:
+        """
+        :return: List of primary key columns
+        """
+        pk_constraint = self.db.inspect.get_pk_constraint(self.name, schema=self.schema)
+        return pk_constraint.get('constrained_columns', [])
+
+    def has_column(self, column: str) -> bool:
         """Check if a column with the given name exists on this table."""
         key = normalize_column_key(normalize_column_name(column))
         return key in self._column_keys
@@ -303,7 +356,7 @@ class Table(object):
             self._columns = None
             try:
                 self._table = SQLATable(
-                    self.name, self.db.metadata, schema=self.db.schema, autoload=True
+                    self.name, self.db.metadata, schema=self.schema, autoload=True
                 )
             except NoSuchTableError:
                 self._table = None
@@ -330,7 +383,7 @@ class Table(object):
             with self.db.lock:
                 self._threading_warn()
                 self._table = SQLATable(
-                    self.name, self.db.metadata, schema=self.db.schema
+                    self.name, self.db.metadata, schema=self.schema
                 )
                 if self._primary_id is not False:
                     # This can go wrong on DBMS like MySQL and SQLite where
@@ -353,7 +406,7 @@ class Table(object):
                 self._threading_warn()
                 for column in columns:
                     if not self.has_column(column.name):
-                        self.db.op.add_column(self.name, column, schema=self.db.schema)
+                        self.db.op.add_column(self.name, column, schema=self.schema)
                 self._reflect_table()
 
     def _sync_columns(self, row, ensure, types=None):
@@ -535,7 +588,7 @@ class Table(object):
         for column in columns:
             if not self.has_column(column):
                 return False
-        indexes = self.db.inspect.get_indexes(self.name, schema=self.db.schema)
+        indexes = self.db.inspect.get_indexes(self.name, schema=self.schema)
         for index in indexes:
             idx_columns = index.get("column_names", [])
             if len(columns.intersection(idx_columns)) == len(columns):
@@ -729,3 +782,90 @@ class Table(object):
     def __repr__(self):
         """Get table representation."""
         return "<Table(%s)>" % self.table.name
+
+    def insert_many_resolve_conflict(self,
+                                     rows: list[dict],
+                                     keys: list[str] = None,
+                                     on_conflict: Literal['update', 'ignore'] = None,
+                                     chunk_size: int = 10000):
+        if not rows:
+            return
+
+        structure = self.structure
+        if keys is None:
+            keys = self.primary_key
+
+        all_columns = set()
+        for row in rows:
+            all_columns.update(row.keys())
+        all_columns = list(all_columns & set(structure.keys()))
+        all_columns_sql_template = ', '.join([f'"{key}"' for key in all_columns])
+        all_values_sql_template = ', '.join(["(:" + key.replace(' ', '_') + "{i})" for i, key in enumerate(all_columns)])
+
+        on_conflict_statement = ''
+        on_conflict_columns_sql_template = None
+        if keys:
+            on_conflict_columns_sql_template = ','.join([f'"{key}"' for key in keys])
+        if on_conflict == 'update':
+            update_keys = list(set(all_columns).difference(set(keys)))
+            if not update_keys:
+                raise ValueError('No columns to update')
+            on_conflict_values_sql_template = ','.join([f'"{key}"=EXCLUDED."{key}"' for key in update_keys])
+            on_conflict_statement = f'ON CONFLICT({on_conflict_columns_sql_template}) DO UPDATE SET {on_conflict_values_sql_template}'
+        elif on_conflict == 'ignore':
+            on_conflict_statement = f'ON CONFLICT({on_conflict_columns_sql_template}) DO NOTHING'
+
+        for index in range(0, len(rows), chunk_size):
+            chunk = rows[index: index + chunk_size]
+            for i, v in enumerate(chunk):
+                chunk[i] = {
+                    column_name: json.dumps(v[column_name]) if structure[column_name] == 'json' else v.get(column_name)
+                    for column_name in all_columns
+                }
+
+            batch_sql_template = ", ".join([f"({all_values_sql_template.format(i=i)})" for i in range(len(chunk))])
+            params = {f"{key.replace(' ', '_')}{i}": row[key] for i, row in enumerate(chunk) for key in row}
+            query_str = f"""INSERT INTO "{self.name}" ({all_columns_sql_template}) VALUES {batch_sql_template} {on_conflict_statement}"""
+
+            self.db.query(query_str, **params)
+            self.db.commit()
+
+    def insert_many_on_conflict_ignore(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000) -> None:
+        self.insert_many_resolve_conflict(rows, keys, on_conflict='ignore', chunk_size=chunk_size)
+
+    def insert_many_on_conflict_update(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000) -> None:
+        self.insert_many_resolve_conflict(rows, keys, on_conflict='update', chunk_size=chunk_size)
+
+    def replace_all_data(self, data) -> None:
+        import numpy as np
+
+        data.columns = [x.replace(".", "_").replace("-", "_") for x in data.columns]
+        data = data.replace(np.nan, None)
+        values = data.to_dict('records')
+        self.db.begin()
+        self.delete()
+        self.insert_many(values)
+        self.db.commit()
+
+    def make_copy(self, copy_table_fullname: str, copy_index: bool = True, allow_drop_if_exists: bool = False) -> None:
+        """
+        Copies table definition (without data)
+
+        :param copy_table_fullname: table fullname that could include schema
+        :param copy_index: if True creates indexes on destination table
+        :param allow_drop_if_exists: if True drops destination table if exists before copying
+        """
+        copy_table_schema, copy_table_name = extract_schema_and_table(copy_table_fullname, self.schema)
+        self.db.begin()
+        if allow_drop_if_exists:
+            self.db[copy_table_fullname].drop()
+        self.db.query(f"""
+            CREATE TABLE {copy_table_schema}."{copy_table_name}" AS
+            SELECT * FROM {self.schema}."{self.name}" WHERE 1=0
+        """)
+        if copy_index:
+            sql_statements = list(self.indexes.values())
+            for sql in sql_statements:
+                sql = sql.replace(self.name, copy_table_name).replace(self.schema + '.', copy_table_schema + '.')
+                self.db.query(sql)
+        self.db.commit()
