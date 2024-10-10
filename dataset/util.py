@@ -109,7 +109,7 @@ class ResultIter(object):
         self.result_proxy.close()
 
 
-def normalize_column_name(name):
+def normalize_column_name(name: str) -> str:
     """Check if a string is a reasonable thing to use as a column name."""
     if not isinstance(name, str):
         raise ValueError("%r is not a valid column name." % name)
@@ -121,12 +121,12 @@ def normalize_column_name(name):
         while len(name.encode("utf-8")) >= 64:
             name = name[: len(name) - 1]
 
-    if not len(name) or "." in name or "-" in name:
+    if not len(name):
         raise ValueError("%r is not a valid column name." % name)
     return name
 
 
-def normalize_column_key(name):
+def normalize_column_key(name: str) -> str | None:
     """Return a comparable column name."""
     if name is None or not isinstance(name, str):
         return None
@@ -178,7 +178,10 @@ def extract_schema_and_table(table_fullname: str, default_schema: str = 'public'
     :return: tuple[table_schema: str, table_name: str]
     """
     if '.' in table_fullname:
-        schema, table = table_fullname.split('.')
+        components = table_fullname.split('.')
+        schema = components[0]
+        table = '.'.join(components[1:])
+        return schema, table
     else:
         schema, table = default_schema, table_fullname
     return schema, table
