@@ -5,7 +5,7 @@ with open("README.md") as f:
 
 setup(
     name="dataset",
-    version="1.6.4",
+    version="1.6.5",
     description="Toolkit for Python-based database access.",
     long_description=long_description,
     long_description_content_type="text/markdown",
