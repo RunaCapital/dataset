@@ -12,6 +12,7 @@ from sqlalchemy.sql.expression import bindparam, ClauseElement
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
 from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .types import Types, MYSQL_LENGTH_TYPES
 from .util import index_name
@@ -33,6 +34,8 @@ class Table(object):
     PRIMARY_DEFAULT = "id"
 
     _table: SQLATable = None
+    _columns: dict | None = None
+    _indexes: list = []
 
     def __init__(
         self,
@@ -49,8 +52,6 @@ class Table(object):
         self.schema = table_schema
         self.name = normalize_table_name(table_name)
         self.fullname = self.schema + '.' + self.name
-        self._columns = None
-        self._indexes = []
         self._primary_id = (
             primary_id if primary_id is not None else self.PRIMARY_DEFAULT
         )
@@ -329,8 +330,11 @@ class Table(object):
         """
         # Removing a bulk implementation in 5e09aba401. Doing this one by one
         # is incredibly slow, but doesn't run into issues with column creation.
-        for row in rows:
-            self.upsert(row, keys, ensure=ensure, types=types)
+        if self.db.is_postgres:
+            self.insert_many_on_conflict_update(rows, keys, chunk_size, ensure)
+        else:
+            for row in rows:
+                self.upsert(row, keys, ensure=ensure, types=types)
 
     def delete(self, *clauses, **filters):
         """Delete rows from the table.
@@ -783,58 +787,77 @@ class Table(object):
         """Get table representation."""
         return "<Table(%s)>" % self.table.name
 
-    def insert_many_resolve_conflict(self,
-                                     rows: list[dict],
-                                     keys: list[str] = None,
-                                     on_conflict: Literal['update', 'ignore'] = None,
-                                     chunk_size: int = 10000):
+    def insert_many_on_conflict(self,
+                                rows: list[dict],
+                                keys: list[str],
+                                on_conflict: Literal['update', 'ignore'] = 'ignore',
+                                chunk_size: int = 10000,
+                                ensure: bool = None):
+        """
+        Inserts multiple rows into a specified table. If a conflict occurs on the unique keys,
+        updates the existing rows with the new values.
+
+        Parameters:
+            rows (list[dict]): A list of dictionaries, each representing a row to insert.
+            keys (list[str]): List of column names that constitute the unique constraint.
+            on_conflict(Literal['update', 'ignore']): Conflict resolution strategy
+            chunk_size(int): Size of chunk to be inserted into database
+            ensure(bool): Whether to sync table schema or not
+
+        Raises:
+            DatasetException: If current database is not PostgreSQL
+        """
+        if not self.db.is_postgres:
+            raise Exception('Method supports only PostgreSQL databases')
         if not rows:
             return
+        if not keys:
+            raise DatasetException("No unique keys provided for conflict resolution.")
 
-        structure = self.structure
-        if keys is None:
-            keys = self.primary_key
-
-        all_columns = set()
+        # Sync table before inputting rows.
+        sync_row = {}
         for row in rows:
-            all_columns.update(row.keys())
-        all_columns = list(all_columns & set(structure.keys()))
-        all_columns_sql_template = ', '.join([f'"{key}"' for key in all_columns])
-        all_values_sql_template = ', '.join(["(:" + key.replace(' ', '_') + "{i})" for i, key in enumerate(all_columns)])
+            # Only get non-existing columns.
+            sync_keys = list(sync_row.keys())
+            for key in [k for k in row.keys() if k not in sync_keys]:
+                # Get a sample of the new column(s) from the row.
+                sync_row[key] = row[key]
+        self._sync_columns(sync_row, ensure)
 
-        on_conflict_statement = ''
-        on_conflict_columns_sql_template = None
-        if keys:
-            on_conflict_columns_sql_template = ','.join([f'"{key}"' for key in keys])
-        if on_conflict == 'update':
-            update_keys = list(set(all_columns).difference(set(keys)))
-            if not update_keys:
-                raise ValueError('No columns to update')
-            on_conflict_values_sql_template = ','.join([f'"{key}"=EXCLUDED."{key}"' for key in update_keys])
-            on_conflict_statement = f'ON CONFLICT({on_conflict_columns_sql_template}) DO UPDATE SET {on_conflict_values_sql_template}'
-        elif on_conflict == 'ignore':
-            on_conflict_statement = f'ON CONFLICT({on_conflict_columns_sql_template}) DO NOTHING'
+        # Get columns name list to be used for padding later.
+        columns = list(set(sync_row.keys()) & set(self.columns))
 
         for index in range(0, len(rows), chunk_size):
             chunk = rows[index: index + chunk_size]
-            for i, v in enumerate(chunk):
-                chunk[i] = {
-                    column_name: json.dumps(v[column_name]) if structure[column_name] == 'json' else v.get(column_name)
-                    for column_name in all_columns
-                }
+            chunk = pad_chunk_columns(chunk, columns)
 
-            batch_sql_template = ", ".join([f"({all_values_sql_template.format(i=i)})" for i in range(len(chunk))])
-            params = {f"{key.replace(' ', '_')}{i}": row[key] for i, row in enumerate(chunk) for key in row}
-            query_str = f"""INSERT INTO {self.schema}."{self.name}" ({all_columns_sql_template}) VALUES {batch_sql_template} {on_conflict_statement}"""
+            stmt = pg_insert(self.table).values(chunk)
 
-            self.db.query(query_str, **params)
-            self.db.commit()
+            # Access the 'excluded' pseudo-table
+            excluded = stmt.excluded
 
-    def insert_many_on_conflict_ignore(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000) -> None:
-        self.insert_many_resolve_conflict(rows, keys, on_conflict='ignore', chunk_size=chunk_size)
+            # Determine columns to update (exclude unique keys)
+            update_cols = {c.name: excluded[c.name] for c in self.table.columns if c.name in columns and c.name not in keys}
 
-    def insert_many_on_conflict_update(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000) -> None:
-        self.insert_many_resolve_conflict(rows, keys, on_conflict='update', chunk_size=chunk_size)
+            if not update_cols:
+                # If all columns are unique keys, do nothing on conflict
+                stmt = stmt.on_conflict_do_nothing(index_elements=keys)
+            else:
+                if on_conflict == 'ignore':
+                    stmt = stmt.on_conflict_do_nothing(index_elements=keys)
+                else:
+                    # Update the columns that are not unique keys
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=keys,
+                        set_=update_cols
+                    )
+            self.db.executable.execute(stmt)
+
+    def insert_many_on_conflict_ignore(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000, ensure: bool = None) -> None:
+        self.insert_many_on_conflict(rows, keys, on_conflict='ignore', chunk_size=chunk_size, ensure=ensure)
+
+    def insert_many_on_conflict_update(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000, ensure: bool = None) -> None:
+        self.insert_many_on_conflict(rows, keys, on_conflict='update', chunk_size=chunk_size, ensure=ensure)
 
     def replace_all_data(self, data) -> None:
         import numpy as np

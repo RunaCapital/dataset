@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from hashlib import sha1
 from urllib.parse import urlparse, urlencode
 from collections import OrderedDict
@@ -159,13 +160,13 @@ def index_name(table, columns):
     return "ix_%s_%s" % (table, key)
 
 
-def pad_chunk_columns(chunk, columns):
+def pad_chunk_columns(chunk: Iterable[dict], columns: Iterable[str]) -> Iterable[dict]:
     """Given a set of items to be inserted, make sure they all have the
     same columns by padding columns with None if they are missing."""
-    for record in chunk:
-        for column in columns:
-            record.setdefault(column, None)
-    return chunk
+    return [
+        {column: record.get(column) for column in columns}
+        for record in chunk
+    ]
 
 
 def extract_schema_and_table(table_fullname: str, default_schema: str = 'public') -> tuple[str, str]:
