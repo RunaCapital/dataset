@@ -1,5 +1,4 @@
-import json
-from typing import TYPE_CHECKING, Type, Literal
+from typing import TYPE_CHECKING, Type, Literal, Iterable
 
 import logging
 import warnings
@@ -28,12 +27,17 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+InputRow = dict
+InputRows = list[InputRow]
+RowTypes = dict[str, Type]
+
+
 class Table(object):
     """Represents a table in a database and exposes common operations."""
 
     PRIMARY_DEFAULT = "id"
 
-    _table: SQLATable = None
+    _table: SQLATable | None = None
     _columns: dict | None = None
     _indexes: list = []
 
@@ -99,7 +103,7 @@ class Table(object):
         return list(self._column_keys.values())
 
     @property
-    def structure(self) -> dict[str, str]:
+    def columns_types(self) -> dict[str, str]:
         """
         Retrieve the table structure as a dictionary mapping column names to data types.
 
@@ -151,7 +155,7 @@ class Table(object):
         key = normalize_column_key(name)
         return self._column_keys.get(key, name)
 
-    def insert(self, row, ensure=None, types=None):
+    def insert(self, row: InputRow, ensure: bool = None, types: RowTypes = None):
         """Add a ``row`` dict by inserting it into the table.
 
         If ``ensure`` is set, any of the keys of the row are not
@@ -175,7 +179,7 @@ class Table(object):
             return res.inserted_primary_key[0]
         return True
 
-    def insert_ignore(self, row, keys, ensure=None, types=None):
+    def insert_ignore(self, row: InputRow, keys: Iterable[str], ensure: bool = None, types: RowTypes = None):
         """Add a ``row`` dict into the table if the row does not exist.
 
         If rows with matching ``keys`` exist no change is made.
@@ -201,7 +205,27 @@ class Table(object):
             return self.insert(row, ensure=False)
         return False
 
-    def insert_many(self, rows, chunk_size=1000, ensure=None, types=None):
+    def insert_ignore_many(self, rows: InputRows, keys: Iterable[str], chunk_size: int = 1000, ensure: bool = None, types: RowTypes = None):
+        """Add ``rows`` dicts into the table if not exist.
+
+        If rows with matching ``keys`` exist no change is made.
+
+        Setting ``ensure`` results in automatically creating missing columns,
+        i.e., keys of the row are not table columns.
+
+        During column creation, ``types`` will be checked for a key
+        matching the name of a column to be created, and the given
+        SQLAlchemy column type will be used. Otherwise, the type is
+        guessed from the row value, defaulting to a simple unicode
+        field.
+        """
+        if self.db.is_postgres:
+            self._pg_insert_many_on_conflict(rows, keys, on_conflict='ignore', chunk_size=chunk_size, ensure=ensure, types=types)
+        else:
+            for row in rows:
+                self.insert_ignore(row, keys, ensure=ensure, types=types)
+
+    def insert_many(self, rows: InputRows, chunk_size: int = 1000, ensure: bool = None, types: RowTypes = None):
         """Add many rows at a time.
 
         This is significantly faster than adding them one by one. Per default
@@ -238,7 +262,7 @@ class Table(object):
                 self.table.insert().execute(chunk)
                 chunk = []
 
-    def update(self, row, keys, ensure=None, types=None, return_count=False):
+    def update(self, row: InputRow, keys: Iterable[str], ensure: bool = None, types: RowTypes = None, return_count: bool = False):
         """Update a row in the table.
 
         The update is managed via the set of column names stated in ``keys``:
@@ -267,7 +291,7 @@ class Table(object):
         if return_count:
             return self.count(clause)
 
-    def update_many(self, rows, keys, chunk_size=1000, ensure=None, types=None):
+    def update_many(self, rows: InputRows, keys: Iterable[str], chunk_size: int = 1000, ensure: bool = None, types: RowTypes = None):
         """Update many rows in the table at a time.
 
         This is significantly faster than updating them one by one. Per default
@@ -302,7 +326,7 @@ class Table(object):
                 self.db.executable.execute(stmt, chunk)
                 chunk = []
 
-    def upsert(self, row, keys, ensure=None, types=None):
+    def upsert(self, row: InputRow, keys: Iterable[str], ensure: bool = None, types: RowTypes = None):
         """An UPSERT is a smart combination of insert and update.
 
         If rows with matching ``keys`` exist they will be updated, otherwise a
@@ -320,7 +344,7 @@ class Table(object):
             return self.insert(row, ensure=False)
         return True
 
-    def upsert_many(self, rows, keys, chunk_size=1000, ensure=None, types=None):
+    def upsert_many(self, rows: InputRows, keys: Iterable[str], chunk_size: int = 1000, ensure: bool = None, types: RowTypes = None):
         """
         Sorts multiple input rows into upserts and inserts. Inserts are passed
         to insert and upserts are updated.
@@ -331,7 +355,7 @@ class Table(object):
         # Removing a bulk implementation in 5e09aba401. Doing this one by one
         # is incredibly slow, but doesn't run into issues with column creation.
         if self.db.is_postgres:
-            self.insert_many_on_conflict_update(rows, keys, chunk_size, ensure)
+            self._pg_insert_many_on_conflict(rows, keys, on_conflict='update', chunk_size=chunk_size, ensure=ensure, types=types)
         else:
             for row in rows:
                 self.upsert(row, keys, ensure=ensure, types=types)
@@ -413,7 +437,7 @@ class Table(object):
                         self.db.op.add_column(self.name, column, schema=self.schema)
                 self._reflect_table()
 
-    def _sync_columns(self, row, ensure, types=None):
+    def _sync_columns(self, row: InputRow, ensure: bool | None, types: RowTypes = None):
         """Create missing columns (or the table) prior to writes.
 
         If automatic schema generation is disabled (``ensure`` is ``False``),
@@ -787,19 +811,22 @@ class Table(object):
         """Get table representation."""
         return "<Table(%s)>" % self.table.name
 
-    def insert_many_on_conflict(self,
-                                rows: list[dict],
-                                keys: list[str],
-                                on_conflict: Literal['update', 'ignore'] = 'ignore',
-                                chunk_size: int = 10000,
-                                ensure: bool = None):
+    # Postgres specific
+    def _pg_insert_many_on_conflict(self,
+                                    rows: InputRows,
+                                    keys: Iterable[str],
+                                    *,
+                                    on_conflict: Literal['update', 'ignore'] = 'ignore',
+                                    chunk_size: int = 1000,
+                                    ensure: bool = None,
+                                    types: RowTypes = None):
         """
         Inserts multiple rows into a specified table. If a conflict occurs on the unique keys,
         updates the existing rows with the new values.
 
         Parameters:
-            rows (list[dict]): A list of dictionaries, each representing a row to insert.
-            keys (list[str]): List of column names that constitute the unique constraint.
+            rows (Iterable[Any]): rows to insert.
+            keys (Iterable[str]): List of column names that constitute the unique constraint.
             on_conflict(Literal['update', 'ignore']): Conflict resolution strategy
             chunk_size(int): Size of chunk to be inserted into database
             ensure(bool): Whether to sync table schema or not
@@ -807,8 +834,7 @@ class Table(object):
         Raises:
             DatasetException: If current database is not PostgreSQL
         """
-        if not self.db.is_postgres:
-            raise Exception('Method supports only PostgreSQL databases')
+        assert self.db.is_postgres
         if not rows:
             return
         if not keys:
@@ -822,7 +848,10 @@ class Table(object):
             for key in [k for k in row.keys() if k not in sync_keys]:
                 # Get a sample of the new column(s) from the row.
                 sync_row[key] = row[key]
-        self._sync_columns(sync_row, ensure)
+        self._sync_columns(sync_row, ensure, types)
+
+        if self._check_ensure(ensure):
+            self.create_index(keys)
 
         # Get columns name list to be used for padding later.
         columns = list(set(sync_row.keys()) & set(self.columns))
@@ -852,23 +881,6 @@ class Table(object):
                         set_=update_cols
                     )
             self.db.executable.execute(stmt)
-
-    def insert_many_on_conflict_ignore(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000, ensure: bool = None) -> None:
-        self.insert_many_on_conflict(rows, keys, on_conflict='ignore', chunk_size=chunk_size, ensure=ensure)
-
-    def insert_many_on_conflict_update(self, rows: list[dict], keys: list[str] = None, chunk_size: int = 10000, ensure: bool = None) -> None:
-        self.insert_many_on_conflict(rows, keys, on_conflict='update', chunk_size=chunk_size, ensure=ensure)
-
-    def replace_all_data(self, data) -> None:
-        import numpy as np
-
-        data.columns = [x.replace(".", "_").replace("-", "_") for x in data.columns]
-        data = data.replace(np.nan, None)
-        values = data.to_dict('records')
-        self.db.begin()
-        self.delete()
-        self.insert_many(values)
-        self.db.commit()
 
     def make_copy(self, copy_table_fullname: str, copy_index: bool = True, allow_drop_if_exists: bool = False) -> None:
         """
