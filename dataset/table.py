@@ -16,7 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from .types import Types, MYSQL_LENGTH_TYPES
 from .util import index_name
 from .util import DatasetException, ResultIter, QUERY_STEP
-from .util import normalize_table_name, pad_chunk_columns
+from .util import normalize_table_name
 from .util import normalize_column_name, normalize_column_key
 from .util import extract_schema_and_table
 
@@ -55,7 +55,7 @@ class Table(object):
         table_schema, table_name = extract_schema_and_table(table_name, default_schema=database.schema)
         self.schema = table_schema
         self.name = normalize_table_name(table_name)
-        self.fullname = self.schema + '.' + self.name
+        self.fullname = self.schema + '.' + self.name if self.schema else self.name
         self._primary_id = (
             primary_id if primary_id is not None else self.PRIMARY_DEFAULT
         )
@@ -240,27 +240,10 @@ class Table(object):
             table.insert_many(rows)
         """
         # Sync table before inputting rows.
-        sync_row = {}
-        for row in rows:
-            # Only get non-existing columns.
-            sync_keys = list(sync_row.keys())
-            for key in [k for k in row.keys() if k not in sync_keys]:
-                # Get a sample of the new column(s) from the row.
-                sync_row[key] = row[key]
-        self._sync_columns(sync_row, ensure, types=types)
-
-        # Get columns name list to be used for padding later.
-        columns = sync_row.keys()
-
-        chunk = []
-        for index, row in enumerate(rows):
-            chunk.append(row)
-
-            # Insert when chunk_size is fulfilled or this is the last row
-            if len(chunk) == chunk_size or index == len(rows) - 1:
-                chunk = pad_chunk_columns(chunk, columns)
-                self.table.insert().execute(chunk)
-                chunk = []
+        rows = self._sync_columns_many(rows, ensure, types=types)
+        for index in range(0, len(rows), chunk_size):
+            chunk = rows[index: index + chunk_size]
+            self.table.insert().execute(chunk)
 
     def update(self, row: InputRow, keys: Iterable[str], ensure: bool = None, types: RowTypes = None, return_count: bool = False):
         """Update a row in the table.
@@ -437,7 +420,7 @@ class Table(object):
                         self.db.op.add_column(self.name, column, schema=self.schema)
                 self._reflect_table()
 
-    def _sync_columns(self, row: InputRow, ensure: bool | None, types: RowTypes = None):
+    def _sync_columns(self, row: InputRow, ensure: bool | None, types: RowTypes = None) -> InputRow:
         """Create missing columns (or the table) prior to writes.
 
         If automatic schema generation is disabled (``ensure`` is ``False``),
@@ -456,11 +439,36 @@ class Table(object):
             elif ensure:
                 _type = types.get(name)
                 if _type is None:
-                    _type = self.db.types.guess(value)
+                    _type = self.db.types.guess([value])
                 sync_columns[name] = Column(name, _type)
                 out[name] = value
         self._sync_table(sync_columns.values())
         return out
+
+    def _sync_columns_many(self, rows: InputRows, ensure: bool | None, types: RowTypes = None) -> InputRows:
+        ensure = self._check_ensure(ensure)
+        types = types or {}
+        types = {self._get_column_name(k): v for (k, v) in types.items()}
+        out_columns = set()
+        sync_columns = {}
+        rows_columns = set()
+        for row in rows:
+            rows_columns.update(row.keys())
+        transformed_rows: dict[str, list] = {
+            self._get_column_name(column): [row.get(column) for row in rows]
+            for column in rows_columns
+        }
+        for name, values in transformed_rows.items():
+            if self.has_column(name):
+                out_columns.add(name)
+            if ensure:
+                _type = types.get(name)
+                if _type is None:
+                    _type = self.db.types.guess(values)
+                sync_columns[name] = Column(name, _type)
+                out_columns.add(name)
+        self._sync_table(sync_columns.values())
+        return [{column: row.get(column) for column in out_columns} for row in rows]
 
     def _check_ensure(self, ensure):
         if ensure is None:
@@ -570,7 +578,7 @@ class Table(object):
         If a column of the same name already exists, no action is taken, even
         if it is not of the type we would have created.
         """
-        type_ = self.db.types.guess(value)
+        type_ = self.db.types.guess([value])
         self.create_column(name, type_)
 
     def drop_column(self, name):
@@ -841,24 +849,15 @@ class Table(object):
             raise DatasetException("No unique keys provided for conflict resolution.")
 
         # Sync table before inputting rows.
-        sync_row = {}
-        for row in rows:
-            # Only get non-existing columns.
-            sync_keys = list(sync_row.keys())
-            for key in [k for k in row.keys() if k not in sync_keys]:
-                # Get a sample of the new column(s) from the row.
-                sync_row[key] = row[key]
-        self._sync_columns(sync_row, ensure, types)
-
+        rows = self._sync_columns_many(rows, ensure, types)
         if self._check_ensure(ensure):
             self.create_index(keys)
 
         # Get columns name list to be used for padding later.
-        columns = list(set(sync_row.keys()) & set(self.columns))
+        columns = list(rows[0].keys())
 
         for index in range(0, len(rows), chunk_size):
             chunk = rows[index: index + chunk_size]
-            chunk = pad_chunk_columns(chunk, columns)
 
             stmt = pg_insert(self.table).values(chunk)
 

@@ -1,4 +1,3 @@
-from collections.abc import Iterable
 from hashlib import sha1
 from urllib.parse import urlparse, urlencode
 from collections import OrderedDict
@@ -158,15 +157,6 @@ def index_name(table, columns):
     sig = "||".join(columns)
     key = sha1(sig.encode("utf-8")).hexdigest()[:16]
     return "ix_%s_%s" % (table, key)
-
-
-def pad_chunk_columns(chunk: Iterable[dict], columns: Iterable[str]) -> Iterable[dict]:
-    """Given a set of items to be inserted, make sure they all have the
-    same columns by padding columns with None if they are missing."""
-    return [
-        {column: record.get(column) for column in columns}
-        for record in chunk
-    ]
 
 
 def extract_schema_and_table(table_fullname: str, default_schema: str = 'public') -> tuple[str, str]:
