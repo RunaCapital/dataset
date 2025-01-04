@@ -10,6 +10,7 @@ build/*
 .watchr
 .coverage
 htmlcov/
+.idea/
 
 *.pyo
 env3/*
