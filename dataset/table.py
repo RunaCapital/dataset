@@ -430,6 +430,7 @@ class Table(object):
         ensure = self._check_ensure(ensure)
         types = types or {}
         types = {self._get_column_name(k): v for (k, v) in types.items()}
+        original_order = list(row.keys())
         out = {}
         sync_columns = {}
         for name, value in row.items():
@@ -443,21 +444,28 @@ class Table(object):
                 sync_columns[name] = Column(name, _type)
                 out[name] = value
         self._sync_table(sync_columns.values())
-        return out
+        # Preserve the original column order in the output
+        return {key: out[key] for key in original_order if key in out}
 
     def _sync_columns_many(self, rows: InputRows, ensure: bool | None, types: RowTypes = None) -> InputRows:
         ensure = self._check_ensure(ensure)
         types = types or {}
         types = {self._get_column_name(k): v for (k, v) in types.items()}
-        out_columns = set()
-        sync_columns = {}
+        # Extract columns in the order they appear in the first row (if rows exist)
+        ordered_columns = list(rows[0].keys()) if rows else []
+        # Add any additional columns that might be missing in other rows
         rows_columns = set()
         for row in rows:
             rows_columns.update(row.keys())
+        # Retain original order and append any new columns at the end
+        ordered_columns = ordered_columns + [col for col in rows_columns if col not in ordered_columns]
+        # Transform the rows to map column names
         transformed_rows: dict[str, list] = {
             self._get_column_name(column): [row.get(column) for row in rows]
             for column in rows_columns
         }
+        out_columns = set()
+        sync_columns = {}
         for name, values in transformed_rows.items():
             if self.has_column(name):
                 out_columns.add(name)
@@ -468,7 +476,11 @@ class Table(object):
                 sync_columns[name] = Column(name, _type)
                 out_columns.add(name)
         self._sync_table(sync_columns.values())
-        return [{column: row.get(column) for column in out_columns} for row in rows]
+        # Generate output rows while preserving the original column order
+        return [
+            {column: row.get(column) for column in ordered_columns if column in out_columns}
+            for row in rows
+        ]
 
     def _check_ensure(self, ensure):
         if ensure is None:
