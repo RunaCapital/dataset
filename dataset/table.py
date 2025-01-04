@@ -430,7 +430,6 @@ class Table(object):
         ensure = self._check_ensure(ensure)
         types = types or {}
         types = {self._get_column_name(k): v for (k, v) in types.items()}
-        original_order = list(row.keys())
         out = {}
         sync_columns = {}
         for name, value in row.items():
@@ -444,8 +443,7 @@ class Table(object):
                 sync_columns[name] = Column(name, _type)
                 out[name] = value
         self._sync_table(sync_columns.values())
-        # Preserve the original column order in the output
-        return {key: out[key] for key in original_order if key in out}
+        return out
 
     def _sync_columns_many(self, rows: InputRows, ensure: bool | None, types: RowTypes = None) -> InputRows:
         ensure = self._check_ensure(ensure)
@@ -462,14 +460,14 @@ class Table(object):
         # Transform the rows to map column names
         transformed_rows: dict[str, list] = {
             self._get_column_name(column): [row.get(column) for row in rows]
-            for column in rows_columns
+            for column in ordered_columns
         }
         out_columns = set()
         sync_columns = {}
         for name, values in transformed_rows.items():
             if self.has_column(name):
                 out_columns.add(name)
-            if ensure:
+            elif ensure:
                 _type = types.get(name)
                 if _type is None:
                     _type = self.db.types.guess(values)
